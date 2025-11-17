@@ -21,24 +21,26 @@ The tool generates both a simulated draft genome and detailed visualizations sho
 - **Detailed reporting**: Comprehensive statistics and region-by-region analysis
 - **Reproducible**: Seed-based random number generation for consistent results
 
-## Requirements
+## Installation
 
-### Dependencies
-
-- Python 3.7+
-- BioPython
-- NumPy
-- Matplotlib
-- pyCirclize
-- [Red](https://github.com/BioinformaticsToolsmith/Red) (REpeat Detector)
-
-### Installation
+### Install Pixi
 
 ```bash
-# Install Python dependencies
-pip install biopython numpy matplotlib pycirclize
+# Linux/macOS
+curl -fsSL https://pixi.sh/install.sh | bash
 
-# Install Red (follow instructions at https://github.com/BioinformaticsToolsmith/Red)
+# Windows PowerShell
+iwr -useb https://pixi.sh/install.ps1 | iex
+```
+
+### Set Up Environment
+
+```bash
+# Install all dependencies (Python, BioPython, NumPy, Matplotlib, pyCirclize, Red)
+pixi install
+
+# Activate the environment
+pixi shell
 ```
 
 ## Usage
@@ -46,9 +48,17 @@ pip install biopython numpy matplotlib pycirclize
 ### Basic Usage
 
 ```bash
-python simulate_complet_with_visualization_no_borders_FIXED.py \
-  --input complete_genome.fasta \
-  --output draft_genome.fasta \
+# Using pixi (recommended)
+pixi run simulate --input GCA_000157015_1.fna \
+  --output example_50_output.fna \
+  --completeness 0.5 \
+  --seed 42
+
+# Or after activating the environment
+pixi shell
+python simulate_dna_completeness.py \
+  --input GCA_000157015_1.fna \
+  --output example_50_output.fna \
   --completeness 0.5 \
   --seed 42
 ```
@@ -56,13 +66,14 @@ python simulate_complet_with_visualization_no_borders_FIXED.py \
 ### With Visualization
 
 ```bash
-python simulate_complet_with_visualization_no_borders_FIXED.py \
-  --input complete_genome.fasta \
-  --output draft_genome.fasta \
+pixi run simulate --input GCA_000157015_1.fna \
+  --output example_50_output.fna \
   --completeness 0.5 \
   --vis_log simulation_report.txt \
   --seed 42
 ```
+
+This example uses the provided `GCA_000157015_1.fna` as input and generates `example_50_output.fna` as the output with 50% target completeness.
 
 ### Command-Line Options
 

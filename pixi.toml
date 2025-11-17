@@ -1,0 +1,17 @@
+[project]
+name = "genome-completeness-simulation"
+version = "0.1.0"
+description = "Tool for simulating realistic draft bacterial genomes"
+channels = ["conda-forge", "bioconda"]
+platforms = ["linux-64", "osx-64", "osx-arm64"]
+
+[dependencies]
+python = ">=3.7"
+biopython = "*"
+numpy = "*"
+matplotlib = "*"
+pycirclize = "*"
+red = "*"
+
+[tasks]
+simulate = "python simulate_dna_completeness.py"
