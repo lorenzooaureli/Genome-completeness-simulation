@@ -2,16 +2,47 @@
 name = "genome-completeness-simulation"
 version = "0.1.0"
 description = "Tool for simulating realistic draft bacterial genomes"
+authors = ["Lorenzo Aureli <lorenzooaureli@users.noreply.github.com>"]
 channels = ["conda-forge", "bioconda"]
 platforms = ["linux-64", "osx-64", "osx-arm64"]
+license = "MIT"
+homepage = "https://github.com/lorenzooaureli/Genome-completeness-simulation"
+repository = "https://github.com/lorenzooaureli/Genome-completeness-simulation"
+readme = "README.md"
 
 [dependencies]
-python = ">=3.7"
-biopython = "*"
-numpy = "*"
-matplotlib = "*"
-pycirclize = "*"
+python = ">=3.8,<4"
+biopython = ">=1.79"
+numpy = ">=1.20"
+matplotlib = ">=3.3"
+pycirclize = ">=0.3.0"
 red = "*"
 
 [tasks]
+# Main simulation task - run the complete genome simulator
 simulate = "python simulate_dna_completeness.py"
+
+# Example tasks for common use cases
+example-basic = "python simulate_dna_completeness.py --input GCA_000157015_1.fna --output example_50_output.fna --completeness 0.5 --seed 42"
+example-with-viz = "python simulate_dna_completeness.py --input GCA_000157015_1.fna --output example_50_output.fna --completeness 0.5 --vis_log simulation_report.txt --seed 42"
+
+# Help and documentation
+help = "python simulate_dna_completeness.py --help"
+
+# Clean generated files
+clean = { cmd = "rm -rf example_*_output.fna *.pdf *.txt *.log", depends-on = [] }
+
+# Verify Red installation
+check-red = "which Red && Red -h || echo 'Red not found in PATH'"
+
+[feature.dev.dependencies]
+# Development dependencies for code quality and testing
+pytest = ">=7.0"
+black = ">=22.0"
+flake8 = ">=5.0"
+ipython = ">=8.0"
+
+[feature.dev.tasks]
+format = "black ."
+lint = "flake8 simulate_dna_completeness.py"
+test = "pytest -v"

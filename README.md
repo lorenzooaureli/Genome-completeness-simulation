@@ -23,7 +23,11 @@ The tool generates both a simulated draft genome and detailed visualizations sho
 
 ## Installation
 
-### Install Pixi
+This project uses [Pixi](https://pixi.sh/) for dependency management, which provides a reproducible environment with all required dependencies including Python packages and the Red repeat detector.
+
+### Prerequisites
+
+Install Pixi (if not already installed):
 
 ```bash
 # Linux/macOS
@@ -33,32 +37,70 @@ curl -fsSL https://pixi.sh/install.sh | bash
 iwr -useb https://pixi.sh/install.ps1 | iex
 ```
 
-### Set Up Environment
+### Quick Start
 
 ```bash
-# Install all dependencies (Python, BioPython, NumPy, Matplotlib, pyCirclize, Red)
+# Clone the repository
+git clone https://github.com/lorenzooaureli/Genome-completeness-simulation.git
+cd Genome-completeness-simulation
+
+# Install all dependencies automatically
 pixi install
 
-# Activate the environment
-pixi shell
+# Verify Red is installed correctly
+pixi run check-red
+```
+
+That's it! Pixi will automatically install:
+- Python (≥3.8)
+- BioPython (≥1.79)
+- NumPy (≥1.20)
+- Matplotlib (≥3.3)
+- pyCirclize (≥0.3.0)
+- Red (repeat detector)
+
+### Development Environment
+
+For development work (linting, formatting, testing):
+
+```bash
+# Install with development dependencies
+pixi install --environment dev
+
+# Run in dev environment
+pixi run -e dev format  # Format code with Black
+pixi run -e dev lint    # Lint code with Flake8
+pixi run -e dev test    # Run tests with pytest
 ```
 
 ## Usage
 
+### Quick Examples
+
+Run predefined example simulations:
+
+```bash
+# Basic simulation (50% completeness, no visualization)
+pixi run example-basic
+
+# Simulation with circular visualization PDF
+pixi run example-with-viz
+```
+
 ### Basic Usage
 
 ```bash
-# Using pixi (recommended)
-pixi run simulate --input GCA_000157015_1.fna \
-  --output example_50_output.fna \
+# Using pixi tasks (recommended)
+pixi run simulate --input <input.fna> \
+  --output <output.fna> \
   --completeness 0.5 \
   --seed 42
 
-# Or after activating the environment
+# Or activate the environment first
 pixi shell
 python simulate_dna_completeness.py \
-  --input GCA_000157015_1.fna \
-  --output example_50_output.fna \
+  --input <input.fna> \
+  --output <output.fna> \
   --completeness 0.5 \
   --seed 42
 ```
@@ -74,6 +116,26 @@ pixi run simulate --input GCA_000157015_1.fna \
 ```
 
 This example uses the provided `GCA_000157015_1.fna` as input and generates `example_50_output.fna` as the output with 50% target completeness.
+
+### Available Pixi Tasks
+
+The `pixi.toml` file defines several convenient tasks:
+
+| Task | Description |
+|------|-------------|
+| `pixi run simulate` | Run the main simulation script |
+| `pixi run example-basic` | Run basic example simulation (50% completeness) |
+| `pixi run example-with-viz` | Run example with visualization |
+| `pixi run help` | Show command-line help |
+| `pixi run check-red` | Verify Red installation |
+| `pixi run clean` | Remove generated output files |
+
+**Development tasks** (requires dev environment):
+| Task | Description |
+|------|-------------|
+| `pixi run -e dev format` | Format code with Black |
+| `pixi run -e dev lint` | Lint code with Flake8 |
+| `pixi run -e dev test` | Run tests with pytest |
 
 ### Command-Line Options
 
@@ -190,27 +252,79 @@ This project is provided as-is for academic and research purposes.
 
 This tool was developed for genome assembly simulation and benchmarking studies.
 
+## Pixi Configuration
+
+The `pixi.toml` file manages all dependencies and tasks for this project:
+
+### Main Dependencies
+
+- **Python** ≥3.8, <4
+- **biopython** ≥1.79 - DNA sequence manipulation
+- **numpy** ≥1.20 - Numerical operations
+- **matplotlib** ≥3.3 - Plotting and visualization
+- **pycirclize** ≥0.3.0 - Circular genome plots
+- **red** - Repeat element detector (from bioconda)
+
+### Development Dependencies (Optional)
+
+Install with `pixi install --environment dev`:
+
+- **pytest** ≥7.0 - Testing framework
+- **black** ≥22.0 - Code formatter
+- **flake8** ≥5.0 - Code linter
+- **ipython** ≥8.0 - Interactive Python shell
+
+### Cross-Platform Support
+
+The pixi configuration supports:
+- Linux (x86_64)
+- macOS Intel (x86_64)
+- macOS Apple Silicon (ARM64)
+
+Windows users should use WSL2 (Windows Subsystem for Linux).
+
 ## Troubleshooting
 
 ### Red Installation Issues
 
-If Red is not found, ensure it's installed and in your PATH:
+If Red is not found after pixi installation:
 ```bash
-which Red
+# Check if Red is available
+pixi run check-red
+
+# Try reinstalling
+pixi install --force-reinstall
+```
+
+### Pixi Environment Issues
+
+If you encounter environment issues:
+```bash
+# Clean and reinstall
+rm -rf .pixi
+pixi install
 ```
 
 ### Memory Errors
 
 For very large genomes, adjust fragmentation parameters:
 ```bash
---max_contig_size 500000 --fragment_size 250000
+pixi run simulate --input large_genome.fna \
+  --output output.fna \
+  --max_contig_size 500000 \
+  --fragment_size 250000 \
+  --completeness 0.5
 ```
 
 ### Visualization Errors
 
-Ensure all required Python packages are installed:
+If visualization fails, ensure all dependencies are installed:
 ```bash
-pip install matplotlib pycirclize
+# Verify installation
+pixi list
+
+# Reinstall if needed
+pixi install --force-reinstall
 ```
 
 ## Acknowledgments
