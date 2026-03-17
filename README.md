@@ -1,4 +1,4 @@
-# Genome Completeness Simulation
+# Genome Quality Simulation
 
 A Python-based tool for simulating realistic draft bacterial genomes in two complementary ways:
 
