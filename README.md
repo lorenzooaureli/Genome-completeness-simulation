@@ -1,21 +1,31 @@
 # Genome Completeness Simulation
 
-A Python-based tool for simulating realistic draft bacterial genomes by selectively removing regions based on their genomic characteristics. This simulator preferentially removes high GC regions, repetitive sequences, and randomly selected fragments to mimic the natural biases observed in draft genome assemblies.
+A Python-based tool for simulating realistic draft bacterial genomes in two complementary ways:
+
+- Reduce sequence content to a target completeness
+- Fragment a complete genome to a target contig N50 while preserving 100% completeness
+
+Both modes prioritize biologically difficult regions such as high-GC segments and repetitive DNA so the resulting assemblies remain biased in realistic ways rather than being purely random.
 
 ## Overview
 
-Draft genome assemblies are often incomplete due to various technical limitations in sequencing and assembly processes. This tool simulates incomplete genomes by intelligently removing specific genomic regions that are typically challenging to assemble:
+Draft genome assemblies can fail in at least two distinct ways: they can be incomplete, and they can be highly fragmented even when nearly complete. This tool models both behaviors by focusing on genomic regions that are typically challenging to assemble:
 
 - **High GC content regions**: Difficult to sequence and assemble
 - **Repetitive sequences**: Detected using [Red](https://github.com/BioinformaticsToolsmith/Red) (REpeat Detector)
-- **Random fragments**: To achieve target completeness levels
+- **Self-homology breakpoints**: Optionally complemented with `nucmer` self-alignment evidence
+- **Random fragments / breakpoints**: Used only when needed to match the requested target
 
-The tool generates both a simulated draft genome and detailed visualizations showing which regions were removed and why.
+The tool generates simulated draft genomes plus detailed reports and optional visualizations showing which regions were removed or where breakpoints were placed.
 
 ## Features
 
 - **Intelligent region selection**: Prioritizes removal of biologically challenging regions
 - **Repeat detection**: Uses Red for accurate identification of repetitive elements
+- **N50 fragmentation mode**: Places assembly-like breakpoints to hit a target contig N50
+- **Breakpoint jitter**: Adds realistic positional noise around candidate breakpoints
+- **Minimum contig size enforcement**: Avoids generating unrealistically tiny contigs in N50 mode
+- **Optional nucmer support**: Can augment Red with exact/near-exact self-homology evidence
 - **Large genome support**: Automatically fragments large contigs for efficient processing
 - **Circular visualization**: Generates publication-quality circular genome plots
 - **Detailed reporting**: Comprehensive statistics and region-by-region analysis
@@ -57,7 +67,14 @@ That's it! Pixi will automatically install:
 - NumPy (≥1.20)
 - Matplotlib (≥3.3)
 - pyCirclize (≥0.3.0)
-- Red (repeat detector)
+- MUMmer (`nucmer`, `show-coords`)
+- Red (repeat detector) on `linux-64` and `osx-64`
+
+Apple Silicon note:
+- Bioconda currently does not provide `red` for `osx-arm64`
+- On `osx-arm64`, Pixi still solves and installs the rest of the environment
+- The script will skip Red-based repeat detection automatically if `Red` is unavailable
+- `mummer` is installed across all supported platforms, so `--use-nucmer` remains available
 
 ### Development Environment
 
@@ -85,6 +102,12 @@ pixi run example-basic
 
 # Simulation with circular visualization PDF
 pixi run example-with-viz
+
+# Fragment the complete genome to a target N50
+pixi run example-n50
+
+# Fragment and save a contig-length plot
+pixi run example-n50-plot
 ```
 
 ### Basic Usage
@@ -96,6 +119,14 @@ pixi run simulate --input <input.fna> \
   --completeness 0.5 \
   --seed 42
 
+# Or fragment to a target N50 while preserving 100% completeness
+pixi run simulate --input <input.fna> \
+  --output <output.fna> \
+  --target-n50 50000 \
+  --min-contig-size 500 \
+  --n50-plot contig_lengths.pdf \
+  --seed 42
+
 # Or activate the environment first
 pixi shell
 python simulate_dna_completeness.py \
@@ -104,6 +135,14 @@ python simulate_dna_completeness.py \
   --completeness 0.5 \
   --seed 42
 ```
+
+Each run also writes a JSON file with simple contig statistics by default:
+
+```text
+<output>.stats.json
+```
+
+You can override that location with `--stats-json`.
 
 ### With Visualization
 
@@ -117,6 +156,21 @@ pixi run simulate --input GCA_000157015_1.fna \
 
 This example uses the provided `GCA_000157015_1.fna` as input and generates `example_50_output.fna` as the output with 50% target completeness.
 
+### N50 Fragmentation Example
+
+```bash
+pixi run simulate --input GCA_000157015_1.fna \
+  --output example_n50_output.fna \
+  --target-n50 50000 \
+  --min-contig-size 500 \
+  --breakpoint-jitter 100 \
+  --n50-plot example_n50_lengths.pdf \
+  --seed 42
+```
+
+This keeps the genome fully complete, but introduces biologically-motivated breakpoints until the resulting contig set approaches the requested N50.
+The contig-length plot is a horizontal bar chart sorted from longest to shortest, with the N50-defining contig highlighted and target/actual N50 markers overlaid.
+
 ### Available Pixi Tasks
 
 The `pixi.toml` file defines several convenient tasks:
@@ -126,8 +180,11 @@ The `pixi.toml` file defines several convenient tasks:
 | `pixi run simulate` | Run the main simulation script |
 | `pixi run example-basic` | Run basic example simulation (50% completeness) |
 | `pixi run example-with-viz` | Run example with visualization |
+| `pixi run example-n50` | Run example N50 fragmentation simulation |
+| `pixi run example-n50-plot` | Run example N50 simulation and save the contig-length plot |
 | `pixi run help` | Show command-line help |
 | `pixi run check-red` | Verify Red installation |
+| `pixi run check-nucmer` | Verify optional nucmer/show-coords availability |
 | `pixi run clean` | Remove generated output files |
 
 **Development tasks** (requires dev environment):
@@ -143,14 +200,22 @@ The `pixi.toml` file defines several convenient tasks:
 |--------|-------------|---------|
 | `--input` | Path to complete genome FASTA file (required) | - |
 | `--output` | Path for output draft genome FASTA (required) | - |
-| `--completeness` | Target completeness (0-1 or 0-100 for percentage) | 0.5 |
+| `--completeness` | Target completeness (0-1 or 0-100 for percentage) | - |
+| `--target-n50` | Target output contig N50 in bp (mutually exclusive with `--completeness`) | - |
 | `--seed` | Random seed for reproducibility | 42 |
 | `--num_threads` | Number of threads for Red | 8 |
 | `--max_contig_size` | Maximum contig size before fragmentation (bp) | 1,000,000 |
 | `--fragment_size` | Fragment size for large contigs (bp) | 500,000 |
 | `--overlap` | Overlap between fragments (bp) | 50,000 |
+| `--min-contig-size` | Minimum contig size enforced in `--target-n50` mode (bp) | 500 |
+| `--breakpoint-jitter` | Maximum absolute Gaussian breakpoint jitter in `--target-n50` mode (bp) | 100 |
+| `--use-nucmer` | Augment Red repeat detection with nucmer self-alignment evidence | off |
+| `--nucmer-min-identity` | Minimum percent identity for nucmer self-homology intervals | 95.0 |
+| `--nucmer-min-length` | Minimum alignment length for nucmer self-homology intervals (bp) | 500 |
 | `--log` | Path to text log file (report only) | - |
 | `--vis_log` | Path to log file with PDF visualization | - |
+| `--n50-plot` | Path to contig-length plot for `--target-n50` mode | - |
+| `--stats-json` | Path to JSON file with output contig statistics | `<output>.stats.json` |
 
 ## Example Output
 
@@ -173,14 +238,17 @@ In this example, a 5.5 Mbp genome was reduced to 50% completeness by removing 2.
 2. **Repeat Detection**: Red analyzes the genome to identify repetitive sequences
    - Large contigs are automatically fragmented for efficient processing
    - Coordinates are properly mapped back to the original genome
+   - Optional `nucmer` self-alignment can add exact and near-exact self-homology evidence
 
 3. **Region Prioritization**: Regions are categorized and prioritized:
    - Highest priority: Regions with both high GC and repeats
    - Medium priority: High GC regions only
    - Medium priority: Repeat regions only
-   - Lowest priority: Random regions (to reach target completeness)
+   - Lowest priority: Random regions / random breakpoints when needed to match the requested target
 
-4. **Selective Removal**: Regions are removed according to priority until target completeness is achieved
+4. **Simulation Mode**:
+   - `--completeness`: Regions are removed according to priority until target completeness is achieved
+   - `--target-n50`: Breakpoints are placed at prioritized region boundaries until the output contig set approaches the requested N50
 
 5. **Output Generation**:
    - Draft genome FASTA with remaining fragments
@@ -204,9 +272,12 @@ GCTAGCTA...
 
 Detailed statistics including:
 - Removal statistics by category
+- Breakpoint statistics by category in N50 mode
 - Region distribution analysis
 - List of all removed regions with coordinates
+- List of breakpoints and contig sizes in N50 mode
 - Actual vs. target completeness
+- Actual vs. target N50
 
 ### Visualization PDF
 

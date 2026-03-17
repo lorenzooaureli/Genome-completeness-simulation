@@ -1,7 +1,7 @@
 [project]
 name = "genome-completeness-simulation"
 version = "0.1.0"
-description = "Tool for simulating realistic draft bacterial genomes"
+description = "Tool for simulating realistic draft bacterial genomes by completeness loss or target N50 fragmentation"
 authors = ["Lorenzo Aureli <lorenzooaureli@users.noreply.github.com>"]
 channels = ["conda-forge", "bioconda"]
 platforms = ["linux-64", "osx-64", "osx-arm64"]
@@ -16,7 +16,16 @@ biopython = ">=1.79"
 numpy = ">=1.20"
 matplotlib = ">=3.3"
 pycirclize = ">=0.3.0"
+mummer = "*"
+
+[target.linux-64.dependencies]
 red = "*"
+
+[target.osx-64.dependencies]
+red = "*"
+
+[environments]
+dev = { features = ["dev"] }
 
 [tasks]
 # Main simulation task - run the complete genome simulator
@@ -25,6 +34,8 @@ simulate = "python simulate_dna_completeness.py"
 # Example tasks for common use cases
 example-basic = "python simulate_dna_completeness.py --input GCA_000157015_1.fna --output example_50_output.fna --completeness 0.5 --seed 42"
 example-with-viz = "python simulate_dna_completeness.py --input GCA_000157015_1.fna --output example_50_output.fna --completeness 0.5 --vis_log simulation_report.txt --seed 42"
+example-n50 = "python simulate_dna_completeness.py --input GCA_000157015_1.fna --output example_n50_output.fna --target-n50 50000 --min-contig-size 500 --breakpoint-jitter 100 --seed 42"
+example-n50-plot = "python simulate_dna_completeness.py --input GCA_000157015_1.fna --output example_n50_output.fna --target-n50 50000 --min-contig-size 500 --breakpoint-jitter 100 --n50-plot example_n50_lengths.pdf --seed 42"
 
 # Help and documentation
 help = "python simulate_dna_completeness.py --help"
@@ -34,6 +45,7 @@ clean = { cmd = "rm -rf example_*_output.fna *.pdf *.txt *.log", depends-on = []
 
 # Verify Red installation
 check-red = "which Red && Red -h || echo 'Red not found in PATH'"
+check-nucmer = "which nucmer && which show-coords || echo 'nucmer/show-coords not found in PATH'"
 
 [feature.dev.dependencies]
 # Development dependencies for code quality and testing

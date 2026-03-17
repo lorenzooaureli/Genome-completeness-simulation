@@ -1,12 +1,14 @@
 # draft_genome_simulator_with_visualization_red_circle_fixed.py
 import argparse
+from bisect import bisect_left
+import json
 import random
 import os
 import sys
 import tempfile
 import shutil
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import Dict, List, Optional, Tuple
 from Bio import SeqIO, SeqRecord
 from Bio.Seq import Seq
 import numpy as np
@@ -296,6 +298,9 @@ def find_repeats_red_simple_fixed(fasta_path: Path, records: List[SeqRecord.SeqR
 def find_repeats_red_fixed(fasta_path: Path, num_threads: int = 8, 
                           max_contig_size: int = 1_000_000, fragment_size: int = 500_000, 
                           overlap: int = 50_000) -> List[Tuple[int, int]]:
+    if shutil.which("Red") is None:
+        print("Warning: Red is not available in PATH; skipping Red repeat detection")
+        return []
     
     # Read original records for coordinate mapping
     records = list(SeqIO.parse(fasta_path, "fasta"))
@@ -426,6 +431,111 @@ def find_repeats_red_fixed(fasta_path: Path, num_threads: int = 8,
             print(f"Error running Red: {e}")
             return []
 
+def find_self_homologies_nucmer(fasta_path: Path, min_identity: float = 95.0,
+                                min_length: int = 500) -> List[Tuple[int, int]]:
+    """
+    Detect exact and near-exact self-homologies with nucmer.
+
+    Coordinates are mapped onto the same concatenated coordinate system used by
+    the Red repeat detector.
+    """
+    missing_tools = [tool for tool in ("nucmer", "show-coords") if shutil.which(tool) is None]
+    if missing_tools:
+        missing = ", ".join(missing_tools)
+        raise RuntimeError(f"--use-nucmer requires the following tools in PATH: {missing}")
+
+    records = list(SeqIO.parse(fasta_path, "fasta"))
+    contig_mapping = create_contig_mapping(records)
+    repeat_regions = set()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        prefix = temp_path / "nucmer_self"
+        delta_path = prefix.with_suffix(".delta")
+
+        nucmer_cmd = [
+            "nucmer",
+            "--maxmatch",
+            "-p", str(prefix),
+            str(fasta_path),
+            str(fasta_path)
+        ]
+
+        debug_print(f"Running nucmer self-alignment: {' '.join(nucmer_cmd)}")
+        nucmer_result = subprocess.run(
+            nucmer_cmd,
+            capture_output=True,
+            text=True,
+            timeout=1800
+        )
+
+        if nucmer_result.returncode != 0:
+            raise RuntimeError(
+                "nucmer failed with return code "
+                f"{nucmer_result.returncode}: {nucmer_result.stderr.strip()}"
+            )
+
+        coords_cmd = ["show-coords", "-THrcl", str(delta_path)]
+        debug_print(f"Parsing nucmer alignments: {' '.join(coords_cmd)}")
+        coords_result = subprocess.run(
+            coords_cmd,
+            capture_output=True,
+            text=True,
+            timeout=1800
+        )
+
+        if coords_result.returncode != 0:
+            raise RuntimeError(
+                "show-coords failed with return code "
+                f"{coords_result.returncode}: {coords_result.stderr.strip()}"
+            )
+
+        for line_num, line in enumerate(coords_result.stdout.splitlines(), 1):
+            if not line.strip():
+                continue
+
+            parts = line.split("\t")
+            if len(parts) < 9:
+                continue
+
+            try:
+                ref_start, ref_end, qry_start, qry_end = map(int, parts[:4])
+                aln_len_ref = int(parts[4])
+                aln_len_qry = int(parts[5])
+                identity = float(parts[6])
+                ref_name = parts[-2].split()[0]
+                qry_name = parts[-1].split()[0]
+            except ValueError:
+                debug_print(f"Skipping unparsable nucmer line {line_num}: {line}")
+                continue
+
+            if min(aln_len_ref, aln_len_qry) < min_length or identity < min_identity:
+                continue
+
+            ref_interval = (min(ref_start, ref_end) - 1, max(ref_start, ref_end))
+            qry_interval = (min(qry_start, qry_end) - 1, max(qry_start, qry_end))
+
+            # Skip the trivial self-diagonal alignment for a sequence against itself.
+            if ref_name == qry_name and ref_interval == qry_interval:
+                continue
+
+            if ref_name not in contig_mapping or qry_name not in contig_mapping:
+                debug_print(
+                    f"Skipping nucmer alignment with unmapped contigs: {ref_name}, {qry_name}"
+                )
+                continue
+
+            repeat_regions.add(
+                (contig_mapping[ref_name] + ref_interval[0], contig_mapping[ref_name] + ref_interval[1])
+            )
+            repeat_regions.add(
+                (contig_mapping[qry_name] + qry_interval[0], contig_mapping[qry_name] + qry_interval[1])
+            )
+
+    merged_regions = merge_overlapping_regions(sorted(repeat_regions))
+    debug_print(f"nucmer detected {len(merged_regions)} self-homology regions after merging")
+    return merged_regions
+
 # Merge overlapping regions
 def merge_overlapping_regions(regions: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
     if not regions:
@@ -493,6 +603,482 @@ def select_candidate_regions(gc_windows, gc_thresh, repeats) -> Tuple[List[Tuple
     both = sorted(list(set(both)))
     
     return sorted(gc_only), sorted(repeat_only), both
+
+def load_input_records(input_fasta: str) -> List[SeqRecord.SeqRecord]:
+    debug_print(f"Reading input FASTA: {input_fasta}")
+
+    if not os.path.exists(input_fasta):
+        raise FileNotFoundError(f"Input file not found: {input_fasta}")
+
+    file_size = os.path.getsize(input_fasta)
+    debug_print(f"Input file size: {file_size:,} bytes")
+
+    debug_print("Parsing FASTA file...")
+    records = []
+    try:
+        for i, record in enumerate(SeqIO.parse(input_fasta, "fasta")):
+            records.append(record)
+            debug_print(f"  Read record {i+1}: {record.id} ({len(record.seq):,} bp)")
+            if i > 0 and i % 100 == 0:
+                debug_print(f"  ... processed {i} records so far")
+    except Exception as exc:
+        debug_print(f"ERROR parsing FASTA: {exc}")
+        raise
+
+    debug_print(f"Loaded {len(records)} records from FASTA")
+    return records
+
+def concatenate_records(records: List[SeqRecord.SeqRecord]) -> Tuple[str, List[Dict[str, int]]]:
+    debug_print("Concatenating sequences...")
+    seq_parts = []
+    record_layout = []
+    cumulative_pos = 0
+
+    for i, record in enumerate(records):
+        rec_seq = str(record.seq)
+        start = cumulative_pos
+        end = start + len(rec_seq)
+        seq_parts.append(rec_seq)
+        record_layout.append({
+            "id": record.id,
+            "start": start,
+            "end": end,
+            "length": len(rec_seq),
+        })
+        cumulative_pos = end
+        debug_print(f"  Processed record {i+1}/{len(records)}: {record.id} ({len(rec_seq):,} bp)")
+
+    debug_print(f"Joining {len(seq_parts)} sequences...")
+    seq = ''.join(seq_parts)
+    debug_print(f"Total sequence length: {len(seq):,} bp")
+    return seq, record_layout
+
+def compute_gc_statistics(seq: str) -> Tuple[int, List[Tuple[int, int, float]], float, float, float]:
+    debug_print("Calculating GC windows...")
+    window_size = min(10000, len(seq) // 10)
+    window_size = max(window_size, 100)
+    debug_print(f"Using window size: {window_size}")
+
+    gc_windows = compute_gc_windows(seq, window_size)
+    debug_print(f"Computed {len(gc_windows)} GC windows")
+    gc_vals = [gc for _, _, gc in gc_windows]
+
+    debug_print("Computing GC statistics...")
+    if gc_vals:
+        mean_gc = float(np.mean(gc_vals))
+        std_gc = float(np.std(gc_vals))
+        gc_thresh = mean_gc + 2 * std_gc
+        debug_print(f"GC stats - mean: {mean_gc:.3f}, std: {std_gc:.3f}, threshold: {gc_thresh:.3f}")
+    else:
+        gc_count = seq.count("G") + seq.count("C")
+        mean_gc = gc_count / len(seq) if len(seq) > 0 else 0.0
+        std_gc = 0.0
+        gc_thresh = 1.0
+        debug_print(f"Small genome - whole GC: {mean_gc:.3f}, threshold: {gc_thresh:.3f}")
+
+    return window_size, gc_windows, mean_gc, std_gc, gc_thresh
+
+def calculate_n50(lengths: List[int]) -> Tuple[int, int]:
+    if not lengths:
+        return 0, 0
+
+    sorted_lengths = sorted(lengths, reverse=True)
+    half_total = sum(sorted_lengths) / 2
+    cumulative = 0
+
+    for idx, length in enumerate(sorted_lengths, 1):
+        cumulative += length
+        if cumulative >= half_total:
+            return length, idx
+
+    return 0, 0
+
+def calculate_nx(lengths: List[int], fraction: float) -> Tuple[int, int]:
+    if not lengths:
+        return 0, 0
+
+    sorted_lengths = sorted(lengths, reverse=True)
+    target = sum(sorted_lengths) * fraction
+    cumulative = 0
+
+    for idx, length in enumerate(sorted_lengths, 1):
+        cumulative += length
+        if cumulative >= target:
+            return length, idx
+
+    return 0, 0
+
+def summarize_contig_lengths(lengths: List[int]) -> Dict[str, object]:
+    if not lengths:
+        return {
+            "contig_count": 0,
+            "total_bases": 0,
+            "min_contig_length": 0,
+            "max_contig_length": 0,
+            "mean_contig_length": 0.0,
+            "median_contig_length": 0.0,
+            "n50": 0,
+            "l50": 0,
+            "n90": 0,
+            "l90": 0,
+            "contigs_ge_500bp": 0,
+            "contigs_ge_1kb": 0,
+            "contigs_ge_10kb": 0,
+            "contigs_ge_50kb": 0,
+            "top_10_lengths": [],
+        }
+
+    sorted_lengths = sorted(lengths, reverse=True)
+    n50, l50 = calculate_n50(sorted_lengths)
+    n90, l90 = calculate_nx(sorted_lengths, 0.9)
+
+    return {
+        "contig_count": len(sorted_lengths),
+        "total_bases": int(sum(sorted_lengths)),
+        "min_contig_length": int(sorted_lengths[-1]),
+        "max_contig_length": int(sorted_lengths[0]),
+        "mean_contig_length": float(np.mean(sorted_lengths)),
+        "median_contig_length": float(np.median(sorted_lengths)),
+        "n50": int(n50),
+        "l50": int(l50),
+        "n90": int(n90),
+        "l90": int(l90),
+        "contigs_ge_500bp": int(sum(length >= 500 for length in sorted_lengths)),
+        "contigs_ge_1kb": int(sum(length >= 1_000 for length in sorted_lengths)),
+        "contigs_ge_10kb": int(sum(length >= 10_000 for length in sorted_lengths)),
+        "contigs_ge_50kb": int(sum(length >= 50_000 for length in sorted_lengths)),
+        "top_10_lengths": [int(length) for length in sorted_lengths[:10]],
+    }
+
+def default_stats_json_path(output_fasta: str) -> str:
+    return str(Path(output_fasta).with_suffix('.stats.json'))
+
+def write_contig_stats_json(stats_json_path: str, payload: Dict[str, object]):
+    with open(stats_json_path, 'w') as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+def prepare_simulation_context(input_fasta: str, num_threads: int = 8,
+                               max_contig_size: int = 1_000_000,
+                               fragment_size: int = 500_000,
+                               overlap: int = 50_000,
+                               use_nucmer: bool = False,
+                               nucmer_min_identity: float = 95.0,
+                               nucmer_min_length: int = 500) -> Dict[str, object]:
+    records = load_input_records(input_fasta)
+    num_original_contigs = len(records)
+    seq, record_layout = concatenate_records(records)
+    genome_name = Path(input_fasta).stem
+
+    window_size, gc_windows, mean_gc, std_gc, gc_thresh = compute_gc_statistics(seq)
+
+    debug_print(f"Starting Red analysis with {num_threads} threads (FIXED VERSION)...")
+    red_repeats = find_repeats_red_fixed(
+        Path(input_fasta),
+        num_threads=num_threads,
+        max_contig_size=max_contig_size,
+        fragment_size=fragment_size,
+        overlap=overlap
+    )
+    debug_print(f"Red analysis completed, found {len(red_repeats)} initial repeat regions")
+
+    nucmer_repeats = []
+    if use_nucmer:
+        debug_print("Starting nucmer self-alignment analysis...")
+        nucmer_repeats = find_self_homologies_nucmer(
+            Path(input_fasta),
+            min_identity=nucmer_min_identity,
+            min_length=nucmer_min_length
+        )
+        debug_print(f"nucmer analysis completed, found {len(nucmer_repeats)} self-homology regions")
+
+    repeats = merge_overlapping_regions(red_repeats + nucmer_repeats)
+    debug_print(f"After merging repeat evidence sources: {len(repeats)} repeat regions")
+
+    if repeats:
+        halfway_point = len(seq) // 2
+        first_half_repeats = sum(1 for start, _ in repeats if start < halfway_point)
+        second_half_repeats = len(repeats) - first_half_repeats
+        debug_print(f"Repeat distribution: {first_half_repeats} in first half, {second_half_repeats} in second half")
+
+    debug_print("Selecting candidate regions...")
+    gc_only, repeat_only, both = select_candidate_regions(gc_windows, gc_thresh, repeats)
+    debug_print(f"Candidate regions - GC only: {len(gc_only)}, repeat only: {len(repeat_only)}, both: {len(both)}")
+
+    debug_print("Merging overlapping regions within categories...")
+    gc_only = merge_overlapping_regions(gc_only)
+    repeat_only = merge_overlapping_regions(repeat_only)
+    both = merge_overlapping_regions(list(both))
+    debug_print(f"After category merging - GC only: {len(gc_only)}, repeat only: {len(repeat_only)}, both: {len(both)}")
+
+    debug_print("Creating block categories and prioritization...")
+    block_categories = {}
+    for block in both:
+        block_categories[block] = 'both'
+    for block in gc_only:
+        block_categories[block] = 'gc_only'
+    for block in repeat_only:
+        block_categories[block] = 'repeat_only'
+
+    prioritized_blocks = both + gc_only + repeat_only
+    debug_print(f"Total prioritized blocks: {len(prioritized_blocks)}")
+
+    initial_lengths = [len(record.seq) for record in records]
+    initial_n50, initial_l50 = calculate_n50(initial_lengths)
+    record_boundaries = [layout["end"] for layout in record_layout[:-1]]
+
+    return {
+        "records": records,
+        "seq": seq,
+        "genome_name": genome_name,
+        "num_original_contigs": num_original_contigs,
+        "record_layout": record_layout,
+        "record_boundaries": record_boundaries,
+        "window_size": window_size,
+        "gc_windows": gc_windows,
+        "mean_gc": mean_gc,
+        "std_gc": std_gc,
+        "gc_thresh": gc_thresh,
+        "red_repeats": red_repeats,
+        "nucmer_repeats": nucmer_repeats,
+        "repeats": repeats,
+        "gc_only": gc_only,
+        "repeat_only": repeat_only,
+        "both": both,
+        "block_categories": block_categories,
+        "prioritized_blocks": prioritized_blocks,
+        "initial_n50": initial_n50,
+        "initial_l50": initial_l50,
+    }
+
+def build_contig_intervals(genome_length: int, breakpoints: List[int]) -> List[Tuple[int, int]]:
+    cleaned_breakpoints = sorted({point for point in breakpoints if 0 < point < genome_length})
+    boundaries = [0] + cleaned_breakpoints + [genome_length]
+    return [
+        (boundaries[i], boundaries[i + 1])
+        for i in range(len(boundaries) - 1)
+        if boundaries[i] < boundaries[i + 1]
+    ]
+
+def summarize_fragmentation_state(genome_length: int, breakpoints: List[int],
+                                  events: List[Dict[str, object]]) -> Dict[str, object]:
+    intervals = build_contig_intervals(genome_length, breakpoints)
+    lengths = [end - start for start, end in intervals]
+    n50, l50 = calculate_n50(lengths)
+    random_breakpoints = sum(1 for event in events if event["category"] == "random")
+
+    return {
+        "breakpoints": sorted(set(breakpoints)),
+        "intervals": intervals,
+        "lengths": lengths,
+        "n50": n50,
+        "l50": l50,
+        "contig_count": len(intervals),
+        "events": [dict(event) for event in events],
+        "random_breakpoints": random_breakpoints,
+    }
+
+def can_place_breakpoint(position: int, existing_breakpoints: List[int], genome_length: int,
+                         min_contig_size: int) -> bool:
+    if position <= 0 or position >= genome_length:
+        return False
+
+    idx = bisect_left(existing_breakpoints, position)
+    if idx < len(existing_breakpoints) and existing_breakpoints[idx] == position:
+        return False
+
+    left_boundary = 0 if idx == 0 else existing_breakpoints[idx - 1]
+    right_boundary = genome_length if idx == len(existing_breakpoints) else existing_breakpoints[idx]
+    return (position - left_boundary) >= min_contig_size and (right_boundary - position) >= min_contig_size
+
+def sample_jittered_breakpoint(anchor: int, existing_breakpoints: List[int], genome_length: int,
+                               min_contig_size: int, rng: random.Random,
+                               breakpoint_jitter: int) -> Optional[int]:
+    candidate_positions = [anchor]
+
+    if breakpoint_jitter > 0:
+        jitter_std = max(1.0, breakpoint_jitter / 2)
+        for _ in range(8):
+            jitter = int(round(rng.gauss(0, jitter_std)))
+            jitter = max(-breakpoint_jitter, min(breakpoint_jitter, jitter))
+            candidate_positions.append(anchor + jitter)
+
+    seen = set()
+    for position in candidate_positions:
+        position = int(round(position))
+        position = max(1, min(genome_length - 1, position))
+        if position in seen:
+            continue
+        seen.add(position)
+
+        if can_place_breakpoint(position, existing_breakpoints, genome_length, min_contig_size):
+            return position
+
+    return None
+
+def collect_breakpoint_candidates(prioritized_blocks: List[Tuple[int, int]],
+                                  block_categories: Dict[Tuple[int, int], str],
+                                  genome_length: int) -> List[Dict[str, object]]:
+    candidates = []
+    seen_anchors = set()
+
+    for start, end in prioritized_blocks:
+        category = block_categories.get((start, end), 'unknown')
+        for edge_name, anchor in (("start", start), ("end", end)):
+            if anchor <= 0 or anchor >= genome_length or anchor in seen_anchors:
+                continue
+
+            seen_anchors.add(anchor)
+            candidates.append({
+                "anchor": anchor,
+                "category": category,
+                "type": "targeted",
+                "edge": edge_name,
+                "source_start": start,
+                "source_end": end,
+            })
+
+    return candidates
+
+def choose_random_breakpoint(genome_length: int, existing_breakpoints: List[int],
+                             min_contig_size: int, rng: random.Random) -> Optional[int]:
+    intervals = build_contig_intervals(genome_length, existing_breakpoints)
+    eligible_intervals = [
+        (start, end, end - start)
+        for start, end in intervals
+        if (end - start) >= (2 * min_contig_size)
+    ]
+
+    if not eligible_intervals:
+        return None
+
+    weights = [length * length for _, _, length in eligible_intervals]
+    selected_start, selected_end, _ = rng.choices(eligible_intervals, weights=weights, k=1)[0]
+    low = selected_start + min_contig_size
+    high = selected_end - min_contig_size
+
+    if low > high:
+        return None
+    if low == high:
+        return low
+
+    return rng.randint(low, high)
+
+def is_better_n50_state(candidate_state: Dict[str, object], best_state: Dict[str, object],
+                        target_n50: int) -> bool:
+    candidate_diff = abs(candidate_state["n50"] - target_n50)
+    best_diff = abs(best_state["n50"] - target_n50)
+
+    if candidate_diff != best_diff:
+        return candidate_diff < best_diff
+
+    candidate_above_target = candidate_state["n50"] >= target_n50
+    best_above_target = best_state["n50"] >= target_n50
+    if candidate_above_target != best_above_target:
+        return candidate_above_target
+
+    if candidate_state["random_breakpoints"] != best_state["random_breakpoints"]:
+        return candidate_state["random_breakpoints"] < best_state["random_breakpoints"]
+
+    return candidate_state["contig_count"] < best_state["contig_count"]
+
+def select_breakpoints_for_target_n50(seq: str, prioritized_blocks: List[Tuple[int, int]],
+                                      block_categories: Dict[Tuple[int, int], str],
+                                      target_n50: int, seed: int,
+                                      mandatory_breakpoints: List[int],
+                                      min_contig_size: int = 500,
+                                      breakpoint_jitter: int = 100) -> Dict[str, object]:
+    genome_length = len(seq)
+    rng = random.Random(seed)
+    current_breakpoints = sorted({point for point in mandatory_breakpoints if 0 < point < genome_length})
+    current_events: List[Dict[str, object]] = []
+    current_state = summarize_fragmentation_state(genome_length, current_breakpoints, current_events)
+    best_state = summarize_fragmentation_state(genome_length, current_breakpoints, current_events)
+
+    if target_n50 <= 0:
+        raise ValueError(f"Target N50 must be a positive integer, got {target_n50}")
+
+    if target_n50 > current_state["n50"]:
+        raise ValueError(
+            f"Target N50 ({target_n50:,} bp) is larger than the input assembly N50 "
+            f"({current_state['n50']:,} bp). This mode can fragment, but it cannot scaffold."
+        )
+
+    if min_contig_size <= 0:
+        raise ValueError(f"Minimum contig size must be positive, got {min_contig_size}")
+
+    debug_print(
+        f"Initial N50 fragmentation state: N50={current_state['n50']:,} bp, "
+        f"contigs={current_state['contig_count']}"
+    )
+
+    candidates = collect_breakpoint_candidates(prioritized_blocks, block_categories, genome_length)
+    debug_print(f"Collected {len(candidates)} targeted breakpoint candidates")
+
+    for candidate in candidates:
+        if current_state["n50"] <= target_n50:
+            break
+
+        position = sample_jittered_breakpoint(
+            candidate["anchor"],
+            current_state["breakpoints"],
+            genome_length,
+            min_contig_size,
+            rng,
+            breakpoint_jitter
+        )
+        if position is None:
+            continue
+
+        current_breakpoints = current_state["breakpoints"] + [position]
+        current_events = current_state["events"] + [{
+            **candidate,
+            "position": position,
+            "jitter": position - candidate["anchor"],
+        }]
+        current_state = summarize_fragmentation_state(genome_length, current_breakpoints, current_events)
+
+        if is_better_n50_state(current_state, best_state, target_n50):
+            best_state = summarize_fragmentation_state(genome_length, current_breakpoints, current_events)
+
+    random_attempts = 0
+    max_random_attempts = max(1000, genome_length // max(min_contig_size, 1))
+    while current_state["n50"] > target_n50 and random_attempts < max_random_attempts:
+        random_attempts += 1
+        position = choose_random_breakpoint(
+            genome_length,
+            current_state["breakpoints"],
+            min_contig_size,
+            rng
+        )
+        if position is None:
+            break
+
+        current_breakpoints = current_state["breakpoints"] + [position]
+        current_events = current_state["events"] + [{
+            "anchor": position,
+            "category": "random",
+            "type": "random",
+            "edge": "random",
+            "source_start": None,
+            "source_end": None,
+            "position": position,
+            "jitter": 0,
+        }]
+        current_state = summarize_fragmentation_state(genome_length, current_breakpoints, current_events)
+
+        if is_better_n50_state(current_state, best_state, target_n50):
+            best_state = summarize_fragmentation_state(genome_length, current_breakpoints, current_events)
+
+    if best_state["n50"] > target_n50:
+        debug_print(
+            f"WARNING: Could not reach target N50 of {target_n50:,} bp; "
+            f"best achievable state was {best_state['n50']:,} bp"
+        )
+    else:
+        debug_print(f"Target N50 reached or crossed; best state N50={best_state['n50']:,} bp")
+
+    return best_state
 
 # Remove blocks from genome with fallback to random non-overlapping blocks - FIXED VERSION
 def remove_blocks(seq: str, preferred_blocks: List[Tuple[int, int]], block_categories: dict, completeness: float, seed: int, debug: bool = False) -> Tuple[List[str], dict, List[dict]]:
@@ -787,121 +1373,272 @@ def create_circular_genome_plot(genome_length: int, removed_regions: List[dict],
     fig.legend(handles=legend_elements, loc='lower center', ncol=4, 
               bbox_to_anchor=(0.5, -0.05), fontsize=10)
     
-    # Save figure
+# Save figure
     plt.tight_layout()
     plt.savefig(output_pdf, format='pdf', dpi=300, bbox_inches='tight')
     plt.close()
 
-# Main function - FIXED VERSION
-def simulate_draft(input_fasta: str, output_fasta: str, completeness: float, seed: int, num_threads: int = 8, 
-                  max_contig_size: int = 1_000_000, fragment_size: int = 500_000, overlap: int = 50_000,
-                  log_file: str = None, create_visualization: bool = False):
-    debug_print("Starting simulate_draft function (FIXED VERSION)")
-    debug_print(f"Reading input FASTA: {input_fasta}")
-    
-    # Check if file exists and is readable
-    if not os.path.exists(input_fasta):
-        raise FileNotFoundError(f"Input file not found: {input_fasta}")
-    
-    file_size = os.path.getsize(input_fasta)
-    debug_print(f"Input file size: {file_size:,} bytes")
-    
-    # Parse FASTA with progress
-    debug_print("Parsing FASTA file...")
-    try:
-        records = []
-        for i, record in enumerate(SeqIO.parse(input_fasta, "fasta")):
-            records.append(record)
-            debug_print(f"  Read record {i+1}: {record.id} ({len(record.seq):,} bp)")
-            if i > 0 and i % 100 == 0:
-                debug_print(f"  ... processed {i} records so far")
-    except Exception as e:
-        debug_print(f"ERROR parsing FASTA: {e}")
-        raise
-    
-    debug_print(f"Loaded {len(records)} records from FASTA")
-    num_original_contigs = len(records)
-    
-    # More efficient concatenation with progress tracking
-    debug_print("Concatenating sequences...")
-    seq_parts = []
-    total_length = 0
-    for i, rec in enumerate(records):
-        rec_seq = str(rec.seq)
-        seq_parts.append(rec_seq)
-        total_length += len(rec_seq)
-        debug_print(f"  Processed record {i+1}/{len(records)}: {rec.id} ({len(rec_seq):,} bp)")
-    
-    debug_print(f"Joining {len(seq_parts)} sequences...")
-    seq = ''.join(seq_parts)
-    debug_print(f"Total sequence length: {len(seq):,} bp")
-    genome_name = Path(input_fasta).stem
+def create_circular_breakpoint_plot(genome_length: int, breakpoint_events: List[Dict[str, object]],
+                                    target_n50: int, actual_n50: int, output_pdf: str,
+                                    genome_name: str = "Genome"):
+    """
+    Create a circular genome plot showing breakpoint positions used for N50 fragmentation.
+    """
+    colors = {
+        'gc_only': '#FF6B6B',
+        'repeat_only': '#7e57c2',
+        'both': '#9ccc65',
+        'random': '#FFE66D'
+    }
 
-    # Adjust window size for small genomes
-    debug_print("Calculating GC windows...")
-    window_size = min(10000, len(seq) // 10)  # Use 1/10 of genome or 10kb, whichever is smaller
-    window_size = max(window_size, 100)  # But at least 100 bases
-    debug_print(f"Using window size: {window_size}")
-    
-    gc_windows = compute_gc_windows(seq, window_size)
-    debug_print(f"Computed {len(gc_windows)} GC windows")
-    gc_vals = [gc for _, _, gc in gc_windows]
-    
-    # Handle empty gc_vals case
-    debug_print("Computing GC statistics...")
-    if gc_vals:
-        mean_gc = np.mean(gc_vals)
-        std_gc = np.std(gc_vals)
-        gc_thresh = mean_gc + 2 * std_gc
-        debug_print(f"GC stats - mean: {mean_gc:.3f}, std: {std_gc:.3f}, threshold: {gc_thresh:.3f}")
+    sectors = {genome_name: genome_length}
+    circos = Circos(sectors, space=2)
+    sector = circos.sectors[0]
+    track = sector.add_track((90, 100))
+    track.axis(fc="lightgray", ec="none", lw=0)
+
+    marker_half_width = max(25, min(1000, genome_length // 2000 if genome_length else 25))
+    for event in breakpoint_events:
+        start = max(0, event["position"] - marker_half_width)
+        end = min(genome_length, event["position"] + marker_half_width)
+        if start == end:
+            end = min(genome_length, start + 1)
+        track.rect(start, end, fc=colors[event["category"]], ec="none", lw=0, alpha=0.8)
+
+    major_ticks = []
+    tick_interval = 10 ** (len(str(genome_length)) - 1)
+    for i in range(0, genome_length, tick_interval):
+        major_ticks.append(i)
+
+    track.xticks(
+        major_ticks,
+        labels=[f"{int(t / 1000)}kb" if t > 0 else "0" for t in major_ticks],
+        label_size=8,
+        label_orientation="vertical"
+    )
+
+    title_text = f"{genome_name}\n"
+    title_text += f"Genome size: {genome_length:,} bp | "
+    title_text += f"Target N50: {target_n50:,} bp | Actual N50: {actual_n50:,} bp"
+
+    fig = circos.plotfig()
+    fig.suptitle(title_text, fontsize=14, y=0.98)
+
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor=colors['gc_only'], label="High GC breakpoint"),
+        Patch(facecolor=colors['repeat_only'], label="Repeat breakpoint"),
+        Patch(facecolor=colors['both'], label="GC+Repeat breakpoint"),
+        Patch(facecolor=colors['random'], label="Random breakpoint")
+    ]
+    fig.legend(handles=legend_elements, loc='lower center', ncol=4,
+               bbox_to_anchor=(0.5, -0.05), fontsize=10)
+
+    plt.tight_layout()
+    plt.savefig(output_pdf, format='pdf', dpi=300, bbox_inches='tight')
+    plt.close()
+
+def create_n50_contig_length_plot(contig_lengths: List[int], target_n50: int, actual_n50: int,
+                                  l50: int, output_path: str, genome_name: str = "Genome"):
+    """
+    Create a ranked contig-length figure for N50 mode.
+
+    The figure contains:
+    - A linear-scale zoom over the longest contigs so the N50-defining contig is readable
+    - A full ranked overview on a log scale so all contigs remain visible
+    """
+    if not contig_lengths:
+        raise ValueError("Cannot create an N50 plot without contig lengths")
+
+    sorted_lengths = sorted(contig_lengths, reverse=True)
+    contig_count = len(sorted_lengths)
+    n50_index = max(0, min(l50 - 1, contig_count - 1))
+
+    default_color = "#B8B8B8"
+    highlight_color = "#D95F02"
+    target_color = "#000000"
+    colors = [default_color] * contig_count
+    colors[n50_index] = highlight_color
+
+    zoom_count = min(contig_count, max(25, l50 + 15))
+    zoom_lengths = sorted_lengths[:zoom_count]
+    zoom_colors = colors[:zoom_count]
+    zoom_positions = np.arange(zoom_count)
+
+    overview_positions = np.arange(contig_count)
+    overview_xmin = max(1, min(sorted_lengths) * 0.5)
+
+    fig = plt.figure(figsize=(13, 10), constrained_layout=True)
+    grid = fig.add_gridspec(2, 1, height_ratios=[1.1, 1.6], hspace=0.25)
+    ax_zoom = fig.add_subplot(grid[0])
+    ax_overview = fig.add_subplot(grid[1])
+
+    ax_zoom.barh(zoom_positions, zoom_lengths, color=zoom_colors, edgecolor="none", height=0.85)
+    ax_zoom.invert_yaxis()
+    n50_line_width = 0.5
+    ax_zoom.axvline(actual_n50, color=highlight_color, linestyle="--", linewidth=n50_line_width, label=f"Actual N50: {actual_n50:,} bp")
+    ax_zoom.axvline(target_n50, color=target_color, linestyle=":", linewidth=n50_line_width, label=f"Target N50: {target_n50:,} bp")
+    ax_zoom.set_title(f"{genome_name} Contig Lengths", fontsize=14)
+    ax_zoom.set_xlabel("Contig length (bp)")
+    ax_zoom.set_ylabel("Top contig ranks")
+    ax_zoom.grid(axis="x", linestyle=":", linewidth=0.5, alpha=0.6)
+
+    if zoom_count <= 40:
+        ax_zoom.set_yticks(zoom_positions)
+        ax_zoom.set_yticklabels([str(i + 1) for i in zoom_positions], fontsize=8)
     else:
-        # If genome is too small for any windows, use whole genome GC
-        gc_count = seq.count("G") + seq.count("C")
-        mean_gc = gc_count / len(seq) if len(seq) > 0 else 0
-        std_gc = 0
-        gc_thresh = 1.0  # Set high threshold so no regions are selected by GC
-        debug_print(f"Small genome - whole GC: {mean_gc:.3f}, threshold: {gc_thresh:.3f}")
+        tick_positions = np.linspace(0, zoom_count - 1, num=12, dtype=int)
+        ax_zoom.set_yticks(tick_positions)
+        ax_zoom.set_yticklabels([str(pos + 1) for pos in tick_positions], fontsize=8)
 
-    debug_print(f"Starting Red analysis with {num_threads} threads (FIXED VERSION)...")
-    repeats = find_repeats_red_fixed(Path(input_fasta), num_threads=num_threads, 
-                              max_contig_size=max_contig_size, fragment_size=fragment_size, overlap=overlap)
-    debug_print(f"Red analysis completed, found {len(repeats)} initial repeat regions")
-    
-    # Show distribution of repeat regions
-    if repeats:
-        halfway_point = len(seq) // 2
-        first_half_repeats = sum(1 for start, end in repeats if start < halfway_point)
-        second_half_repeats = len(repeats) - first_half_repeats
-        debug_print(f"Repeat distribution: {first_half_repeats} in first half, {second_half_repeats} in second half")
-    
-    # Merge overlapping repeat regions to ensure non-overlapping requirement
-    debug_print("Merging overlapping repeat regions...")
-    repeats = merge_overlapping_regions(repeats)
-    debug_print(f"After merging: {len(repeats)} repeat regions")
-    
-    debug_print("Selecting candidate regions...")
-    gc_only, repeat_only, both = select_candidate_regions(gc_windows, gc_thresh, repeats)
-    debug_print(f"Candidate regions - GC only: {len(gc_only)}, repeat only: {len(repeat_only)}, both: {len(both)}")
-    
-    # Merge overlapping regions within each category
-    debug_print("Merging overlapping regions within categories...")
-    gc_only = merge_overlapping_regions(gc_only)
-    repeat_only = merge_overlapping_regions(repeat_only)
-    both = merge_overlapping_regions(list(both))
-    debug_print(f"After category merging - GC only: {len(gc_only)}, repeat only: {len(repeat_only)}, both: {len(both)}")
+    if n50_index < zoom_count:
+        n50_length = sorted_lengths[n50_index]
+        ax_zoom.annotate(
+            f"N50 contig: rank {n50_index + 1}, {n50_length:,} bp",
+            xy=(n50_length, n50_index),
+            xytext=(8, 0),
+            textcoords="offset points",
+            va="center",
+            ha="left",
+            fontsize=9,
+            color=highlight_color,
+        )
 
-    # Create a mapping of blocks to their categories
-    debug_print("Creating block categories and prioritization...")
-    block_categories = {}
-    for block in both:
-        block_categories[block] = 'both'
-    for block in gc_only:
-        block_categories[block] = 'gc_only'
-    for block in repeat_only:
-        block_categories[block] = 'repeat_only'
+    line_widths = np.full(contig_count, 0.6)
+    line_widths[n50_index] = 2.2
+    for y, contig_length, color, width in zip(overview_positions, sorted_lengths, colors, line_widths):
+        ax_overview.hlines(y, overview_xmin, contig_length, colors=color, linewidth=width)
 
-    prioritized_blocks = both + gc_only + repeat_only
-    debug_print(f"Total prioritized blocks: {len(prioritized_blocks)}")
+    ax_overview.invert_yaxis()
+    ax_overview.set_xscale("log")
+    ax_overview.axvline(actual_n50, color=highlight_color, linestyle="--", linewidth=n50_line_width)
+    ax_overview.axvline(target_n50, color=target_color, linestyle=":", linewidth=n50_line_width)
+    ax_overview.set_xlabel("Contig length (bp, log scale)")
+    ax_overview.set_ylabel("All contig ranks")
+    ax_overview.grid(axis="x", linestyle=":", linewidth=0.5, alpha=0.6)
+
+    overview_tick_positions = np.linspace(0, contig_count - 1, num=min(12, contig_count), dtype=int)
+    ax_overview.set_yticks(overview_tick_positions)
+    ax_overview.set_yticklabels([str(pos + 1) for pos in overview_tick_positions], fontsize=8)
+
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], color=default_color, lw=2, label="Other contigs"),
+        Line2D([0], [0], color=highlight_color, lw=2.5, label=f"N50 contig (rank {n50_index + 1})"),
+        Line2D([0], [0], color=highlight_color, lw=n50_line_width, linestyle="--", label=f"Actual N50: {actual_n50:,} bp"),
+        Line2D([0], [0], color=target_color, lw=n50_line_width, linestyle=":", label=f"Target N50: {target_n50:,} bp"),
+    ]
+    ax_zoom.legend(handles=legend_elements, loc="lower right")
+
+    fig.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+def build_fragment_records_from_intervals(seq: str, intervals: List[Tuple[int, int]],
+                                          genome_name: str) -> List[SeqRecord.SeqRecord]:
+    frag_records = []
+    for i, (start, end) in enumerate(intervals):
+        frag_records.append(
+            SeqRecord.SeqRecord(
+                Seq(seq[start:end]),
+                id=f"{genome_name}_frag_{i+1}",
+                description=f"coords={start + 1}-{end}"
+            )
+        )
+    return frag_records
+
+def write_n50_fragmentation_report(log_file: str, input_fasta: str, output_fasta: str,
+                                   target_n50: int, state: Dict[str, object],
+                                   context: Dict[str, object], seed: int,
+                                   num_threads: int, max_contig_size: int,
+                                   fragment_size: int, overlap: int,
+                                   min_contig_size: int, breakpoint_jitter: int,
+                                   use_nucmer: bool):
+    category_counts = {'gc_only': 0, 'repeat_only': 0, 'both': 0, 'random': 0}
+    for event in state["events"]:
+        category_counts[event["category"]] += 1
+
+    contig_lengths = sorted(state["lengths"], reverse=True)
+
+    with open(log_file, 'w') as f:
+        f.write("=== Draft Genome Fragmentation Report (N50 MODE) ===\n\n")
+        f.write(f"Input file: {input_fasta}\n")
+        f.write(f"Output file: {output_fasta}\n")
+        f.write(f"Target N50: {target_n50:,} bp\n")
+        f.write(f"Actual N50: {state['n50']:,} bp\n")
+        f.write(f"Input assembly N50: {context['initial_n50']:,} bp\n")
+        f.write(f"L50: {state['l50']}\n")
+        f.write(f"Random seed: {seed}\n")
+        f.write(f"Number of original contigs: {context['num_original_contigs']}\n")
+        f.write(f"Output contig count: {state['contig_count']}\n")
+        f.write("Completeness preserved: 100.00%\n")
+        f.write(f"Red threads used: {num_threads}\n")
+        f.write(f"Use nucmer: {use_nucmer}\n")
+        f.write(f"Breakpoint jitter (max absolute): {breakpoint_jitter} bp\n")
+        f.write(f"Minimum contig size constraint: {min_contig_size} bp\n")
+        f.write("Fragmentation settings:\n")
+        f.write(f"  - Max contig size: {max_contig_size:,} bp\n")
+        f.write(f"  - Fragment size: {fragment_size:,} bp\n")
+        f.write(f"  - Overlap: {overlap:,} bp\n\n")
+
+        f.write("=== Repeat Evidence ===\n")
+        f.write(f"Red regions: {len(context['red_repeats'])}\n")
+        f.write(f"nucmer regions: {len(context['nucmer_repeats'])}\n")
+        f.write(f"Combined repeat regions after merging: {len(context['repeats'])}\n\n")
+
+        f.write("=== Region Analysis ===\n")
+        f.write(f"GC threshold (mean + 2*std): {context['gc_thresh']:.2%}\n")
+        f.write(f"High GC-only regions: {len(context['gc_only'])}\n")
+        f.write(f"Repeat-only regions: {len(context['repeat_only'])}\n")
+        f.write(f"Both GC+repeat regions: {len(context['both'])}\n")
+        f.write(f"Targeted breakpoints used: {len(state['events']) - state['random_breakpoints']}\n")
+        f.write(f"Random breakpoints used: {state['random_breakpoints']}\n\n")
+
+        f.write("=== Breakpoint Summary by Category ===\n")
+        f.write(f"High GC only breakpoints: {category_counts['gc_only']}\n")
+        f.write(f"Repeat only breakpoints: {category_counts['repeat_only']}\n")
+        f.write(f"Both GC+repeat breakpoints: {category_counts['both']}\n")
+        f.write(f"Random breakpoints: {category_counts['random']}\n\n")
+
+        f.write("=== Output Contig Lengths ===\n")
+        for idx, length in enumerate(contig_lengths, 1):
+            f.write(f"{idx}\t{length:,}\n")
+
+        f.write("\n=== Detailed Breakpoint List ===\n")
+        f.write("Position\tCategory\tType\tAnchor\tJitter\tSourceStart\tSourceEnd\n")
+        f.write("-" * 90 + "\n")
+        for event in sorted(state["events"], key=lambda item: item["position"]):
+            source_start = "" if event["source_start"] is None else f"{event['source_start']:,}"
+            source_end = "" if event["source_end"] is None else f"{event['source_end']:,}"
+            f.write(
+                f"{event['position']:,}\t{event['category']}\t{event['type']}\t"
+                f"{event['anchor']:,}\t{event['jitter']:+,}\t{source_start}\t{source_end}\n"
+            )
+
+def simulate_draft(input_fasta: str, output_fasta: str, completeness: float, seed: int, num_threads: int = 8,
+                  max_contig_size: int = 1_000_000, fragment_size: int = 500_000, overlap: int = 50_000,
+                  log_file: str = None, create_visualization: bool = False,
+                  stats_json_path: str = None,
+                  use_nucmer: bool = False, nucmer_min_identity: float = 95.0,
+                  nucmer_min_length: int = 500):
+    debug_print("Starting simulate_draft function (FIXED VERSION)")
+    context = prepare_simulation_context(
+        input_fasta=input_fasta,
+        num_threads=num_threads,
+        max_contig_size=max_contig_size,
+        fragment_size=fragment_size,
+        overlap=overlap,
+        use_nucmer=use_nucmer,
+        nucmer_min_identity=nucmer_min_identity,
+        nucmer_min_length=nucmer_min_length
+    )
+    seq = context["seq"]
+    genome_name = context["genome_name"]
+    repeats = context["repeats"]
+    gc_only = context["gc_only"]
+    repeat_only = context["repeat_only"]
+    both = context["both"]
+    block_categories = context["block_categories"]
+    prioritized_blocks = context["prioritized_blocks"]
 
     debug_print("Starting block removal...")
     fragments, removal_stats, removed_regions = remove_blocks(seq, prioritized_blocks, block_categories, completeness, seed, debug=False)
@@ -917,17 +1654,23 @@ def simulate_draft(input_fasta: str, output_fasta: str, completeness: float, see
     debug_print("Writing log file and creating output...")
     if log_file:
         with open(log_file, 'w') as f:
-            f.write("=== Draft Genome Simulation Report (FIXED VERSION with Red) ===\n\n")
+            f.write("=== Draft Genome Simulation Report (FIXED VERSION) ===\n\n")
             f.write(f"Input file: {input_fasta}\n")
             f.write(f"Output file: {output_fasta}\n")
             f.write(f"Target completeness: {completeness:.2%}\n")
             f.write(f"Random seed: {seed}\n")
-            f.write(f"Number of original contigs: {num_original_contigs}\n")
+            f.write(f"Number of original contigs: {context['num_original_contigs']}\n")
             f.write(f"Red threads used: {num_threads}\n")
+            f.write(f"Use nucmer: {use_nucmer}\n")
             f.write(f"Fragmentation settings:\n")
             f.write(f"  - Max contig size: {max_contig_size:,} bp\n")
             f.write(f"  - Fragment size: {fragment_size:,} bp\n")
             f.write(f"  - Overlap: {overlap:,} bp\n\n")
+
+            f.write("=== Repeat Evidence ===\n")
+            f.write(f"Red regions: {len(context['red_repeats'])}\n")
+            f.write(f"nucmer regions: {len(context['nucmer_repeats'])}\n")
+            f.write(f"Combined repeat regions after merging: {len(repeats)}\n\n")
             
             f.write("=== Removal Statistics ===\n")
             f.write(f"Total genome size: {removal_stats['total_bases']:,} bases\n")
@@ -960,7 +1703,7 @@ def simulate_draft(input_fasta: str, output_fasta: str, completeness: float, see
                 f.write(f"Repeat regions in second half ({halfway_point:,}-{len(seq):,}): {second_half_repeats}\n\n")
             
             f.write("=== Region Analysis ===\n")
-            f.write(f"GC threshold (mean + 2*std): {gc_thresh:.2%}\n")
+            f.write(f"GC threshold (mean + 2*std): {context['gc_thresh']:.2%}\n")
             f.write(f"Number of high GC-only regions: {len(gc_only)}\n")
             f.write(f"Number of repeat-only regions: {len(repeat_only)}\n")
             f.write(f"Number of both GC+repeat regions: {len(both)}\n")
@@ -1013,42 +1756,257 @@ def simulate_draft(input_fasta: str, output_fasta: str, completeness: float, see
         )
         frag_records.append(new_record)
 
+    contig_lengths = [len(frag) for frag in fragments]
+    contig_stats = summarize_contig_lengths(contig_lengths)
+    stats_json_path = stats_json_path or default_stats_json_path(output_fasta)
+    write_contig_stats_json(
+        stats_json_path,
+        {
+            "mode": "completeness",
+            "input_fasta": input_fasta,
+            "output_fasta": output_fasta,
+            "seed": seed,
+            "parameters": {
+                "completeness": completeness,
+                "num_threads": num_threads,
+                "max_contig_size": max_contig_size,
+                "fragment_size": fragment_size,
+                "overlap": overlap,
+                "use_nucmer": use_nucmer,
+                "nucmer_min_identity": nucmer_min_identity,
+                "nucmer_min_length": nucmer_min_length,
+            },
+            "mode_summary": {
+                "target_completeness": completeness,
+                "actual_completeness": actual_output_size / removal_stats["total_bases"] if removal_stats["total_bases"] else 0.0,
+                "bases_removed": int(removal_stats["total_removed"]),
+                "bases_kept": int(actual_output_size),
+            },
+            "contig_stats": contig_stats,
+        }
+    )
+
     debug_print(f"Writing {len(frag_records)} fragments to {output_fasta}")
     SeqIO.write(frag_records, output_fasta, "fasta")
+    debug_print(f"Saved contig statistics JSON to {stats_json_path}")
     debug_print("simulate_draft function completed successfully! (FIXED VERSION)")
+
+def simulate_target_n50(input_fasta: str, output_fasta: str, target_n50: int, seed: int,
+                        num_threads: int = 8, max_contig_size: int = 1_000_000,
+                        fragment_size: int = 500_000, overlap: int = 50_000,
+                        log_file: str = None, create_visualization: bool = False,
+                        n50_plot_path: str = None, stats_json_path: str = None,
+                        min_contig_size: int = 500, breakpoint_jitter: int = 100,
+                        use_nucmer: bool = False, nucmer_min_identity: float = 95.0,
+                        nucmer_min_length: int = 500):
+    debug_print("Starting simulate_target_n50 function")
+    context = prepare_simulation_context(
+        input_fasta=input_fasta,
+        num_threads=num_threads,
+        max_contig_size=max_contig_size,
+        fragment_size=fragment_size,
+        overlap=overlap,
+        use_nucmer=use_nucmer,
+        nucmer_min_identity=nucmer_min_identity,
+        nucmer_min_length=nucmer_min_length
+    )
+
+    short_input_records = [layout for layout in context["record_layout"] if layout["length"] < min_contig_size]
+    if short_input_records:
+        debug_print(
+            f"Warning: {len(short_input_records)} input records are shorter than the "
+            f"minimum contig size of {min_contig_size} bp and will be preserved as-is"
+        )
+
+    fragmentation_state = select_breakpoints_for_target_n50(
+        seq=context["seq"],
+        prioritized_blocks=context["prioritized_blocks"],
+        block_categories=context["block_categories"],
+        target_n50=target_n50,
+        seed=seed,
+        mandatory_breakpoints=context["record_boundaries"],
+        min_contig_size=min_contig_size,
+        breakpoint_jitter=breakpoint_jitter
+    )
+
+    frag_records = build_fragment_records_from_intervals(
+        context["seq"],
+        fragmentation_state["intervals"],
+        context["genome_name"]
+    )
+
+    debug_print(
+        f"N50 fragmentation completed: target={target_n50:,} bp, "
+        f"actual={fragmentation_state['n50']:,} bp, contigs={fragmentation_state['contig_count']}"
+    )
+
+    if n50_plot_path:
+        debug_print(f"Creating N50 contig-length plot: {n50_plot_path}")
+        create_n50_contig_length_plot(
+            contig_lengths=fragmentation_state["lengths"],
+            target_n50=target_n50,
+            actual_n50=fragmentation_state["n50"],
+            l50=fragmentation_state["l50"],
+            output_path=n50_plot_path,
+            genome_name=context["genome_name"]
+        )
+
+    if log_file:
+        write_n50_fragmentation_report(
+            log_file=log_file,
+            input_fasta=input_fasta,
+            output_fasta=output_fasta,
+            target_n50=target_n50,
+            state=fragmentation_state,
+            context=context,
+            seed=seed,
+            num_threads=num_threads,
+            max_contig_size=max_contig_size,
+            fragment_size=fragment_size,
+            overlap=overlap,
+            min_contig_size=min_contig_size,
+            breakpoint_jitter=breakpoint_jitter,
+            use_nucmer=use_nucmer
+        )
+
+        if create_visualization:
+            if log_file.endswith('.txt'):
+                pdf_path = log_file.replace('.txt', '_visualization.pdf')
+            else:
+                pdf_path = log_file + '_visualization.pdf'
+
+            print(f"Creating circular visualization: {pdf_path}")
+            try:
+                create_circular_breakpoint_plot(
+                    genome_length=len(context["seq"]),
+                    breakpoint_events=fragmentation_state["events"],
+                    target_n50=target_n50,
+                    actual_n50=fragmentation_state["n50"],
+                    output_pdf=pdf_path,
+                    genome_name=context["genome_name"]
+                )
+                debug_print(f"Visualization saved to: {pdf_path}")
+            except Exception as exc:
+                print(f"Warning: Failed to create visualization: {exc}")
+                debug_print(f"Visualization error: {exc}")
+
+    contig_stats = summarize_contig_lengths(fragmentation_state["lengths"])
+    stats_json_path = stats_json_path or default_stats_json_path(output_fasta)
+    write_contig_stats_json(
+        stats_json_path,
+        {
+            "mode": "target_n50",
+            "input_fasta": input_fasta,
+            "output_fasta": output_fasta,
+            "seed": seed,
+            "parameters": {
+                "target_n50": target_n50,
+                "num_threads": num_threads,
+                "max_contig_size": max_contig_size,
+                "fragment_size": fragment_size,
+                "overlap": overlap,
+                "min_contig_size": min_contig_size,
+                "breakpoint_jitter": breakpoint_jitter,
+                "use_nucmer": use_nucmer,
+                "nucmer_min_identity": nucmer_min_identity,
+                "nucmer_min_length": nucmer_min_length,
+            },
+            "mode_summary": {
+                "input_assembly_n50": int(context["initial_n50"]),
+                "input_assembly_l50": int(context["initial_l50"]),
+                "target_n50": int(target_n50),
+                "actual_n50": int(fragmentation_state["n50"]),
+                "actual_l50": int(fragmentation_state["l50"]),
+                "breakpoint_count": int(len(fragmentation_state["events"])),
+                "random_breakpoints": int(fragmentation_state["random_breakpoints"]),
+                "completeness_preserved": 1.0,
+            },
+            "contig_stats": contig_stats,
+        }
+    )
+
+    debug_print(f"Writing {len(frag_records)} fragments to {output_fasta}")
+    SeqIO.write(frag_records, output_fasta, "fasta")
+    debug_print(f"Saved contig statistics JSON to {stats_json_path}")
+    debug_print("simulate_target_n50 function completed successfully!")
 
 if __name__ == "__main__":
     debug_print("Script started, parsing arguments... (FIXED VERSION)")
-    parser = argparse.ArgumentParser(description="FIXED: Simulate realistic draft bacterial genome using Red for repeat detection with circular visualization")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Simulate realistic draft bacterial genomes either by reducing completeness "
+            "or by fragmenting to a target N50 using GC/repeat-aware breakpoint selection"
+        )
+    )
     parser.add_argument("--input", required=True, help="Path to complete genome FASTA")
     parser.add_argument("--output", required=True, help="Output FASTA of simulated draft")
-    parser.add_argument("--completeness", type=float, default=0.5, help="Target completeness (0-100 for percentage, or 0-1 for fraction)")
+    mode_group = parser.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument(
+        "--completeness",
+        type=float,
+        help="Target completeness (0-100 for percentage, or 0-1 for fraction)"
+    )
+    mode_group.add_argument(
+        "--target-n50",
+        type=int,
+        dest="target_n50",
+        help="Target output contig N50 in bp while preserving 100%% completeness"
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--num_threads", type=int, default=8, help="Number of threads for Red (default: 8)")
     parser.add_argument("--max_contig_size", type=int, default=1_000_000, help="Maximum contig size before fragmentation (default: 1MB)")
     parser.add_argument("--fragment_size", type=int, default=500_000, help="Fragment size for large contigs (default: 500kb)")
     parser.add_argument("--overlap", type=int, default=50_000, help="Overlap between fragments (default: 50kb)")
+    parser.add_argument("--min-contig-size", type=int, default=500, help="Minimum contig size enforced in --target-n50 mode (default: 500)")
+    parser.add_argument("--breakpoint-jitter", type=int, default=100, help="Maximum absolute Gaussian breakpoint jitter in bp for --target-n50 mode (default: 100)")
+    parser.add_argument("--use-nucmer", action="store_true", help="Augment Red repeat detection with nucmer self-alignment evidence")
+    parser.add_argument("--nucmer-min-identity", type=float, default=95.0, help="Minimum percent identity for nucmer self-homology intervals (default: 95.0)")
+    parser.add_argument("--nucmer-min-length", type=int, default=500, help="Minimum alignment length for nucmer self-homology intervals (default: 500)")
     parser.add_argument("--log", help="Path to log file (text report only)")
     parser.add_argument("--vis_log", help="Path to log file with circular PDF visualization")
+    parser.add_argument("--n50-plot", dest="n50_plot", help="Path to contig-length plot for --target-n50 mode (PDF/PNG/etc.)")
+    parser.add_argument("--stats-json", dest="stats_json", help="Path to JSON file with output contig statistics (default: <output>.stats.json)")
     
     debug_print("Parsing command line arguments...")
     args = parser.parse_args()
     debug_print("Arguments parsed successfully!")
     debug_print(f"Input: {args.input}")
     debug_print(f"Output: {args.output}")  
-    debug_print(f"Completeness: {args.completeness}")
+    if args.completeness is not None:
+        debug_print(f"Completeness: {args.completeness}")
+    else:
+        debug_print(f"Target N50: {args.target_n50}")
     debug_print(f"Threads: {args.num_threads}")
-
-    # Convert completeness to fraction if given as percentage
-    debug_print("Processing completeness value...")
-    completeness = args.completeness
-    if completeness > 1:
-        completeness = completeness / 100.0
-    debug_print(f"Final completeness: {completeness}")
+    debug_print(f"Use nucmer: {args.use_nucmer}")
     
-    # Validate completeness is in valid range
-    if completeness < 0 or completeness > 1:
-        raise ValueError(f"Completeness must be between 0 and 1 (or 0-100 for percentage), got {args.completeness}")
+    completeness = None
+    if args.completeness is not None:
+        debug_print("Processing completeness value...")
+        completeness = args.completeness
+        if completeness > 1:
+            completeness = completeness / 100.0
+        debug_print(f"Final completeness: {completeness}")
+        if completeness < 0 or completeness > 1:
+            raise ValueError(
+                f"Completeness must be between 0 and 1 (or 0-100 for percentage), got {args.completeness}"
+            )
+    else:
+        if args.target_n50 <= 0:
+            raise ValueError(f"Target N50 must be a positive integer, got {args.target_n50}")
+        if args.min_contig_size <= 0:
+            raise ValueError(f"Minimum contig size must be positive, got {args.min_contig_size}")
+        if args.breakpoint_jitter < 0:
+            raise ValueError(f"Breakpoint jitter must be non-negative, got {args.breakpoint_jitter}")
+        if args.nucmer_min_identity <= 0 or args.nucmer_min_identity > 100:
+            raise ValueError(
+                f"nucmer minimum identity must be in the range (0, 100], got {args.nucmer_min_identity}"
+            )
+        if args.nucmer_min_length <= 0:
+            raise ValueError(
+                f"nucmer minimum alignment length must be positive, got {args.nucmer_min_length}"
+            )
+    if completeness is not None and args.n50_plot:
+        raise ValueError("--n50-plot can only be used together with --target-n50")
     
     # Determine which log file to use and whether to create visualization
     debug_print("Setting up log file and visualization options...")
@@ -1065,20 +2023,46 @@ if __name__ == "__main__":
     else:
         debug_print(f"Using {num_threads} threads from argument")
     
-    debug_print("About to call simulate_draft function... (FIXED VERSION)")
     try:
-        simulate_draft(
-            input_fasta=args.input,
-            output_fasta=args.output,
-            completeness=completeness,
-            seed=args.seed,
-            num_threads=num_threads,
-            max_contig_size=args.max_contig_size,
-            fragment_size=args.fragment_size,
-            overlap=args.overlap,
-            log_file=log_file,
-            create_visualization=create_vis
-        )
+        if completeness is not None:
+            debug_print("About to call simulate_draft function... (FIXED VERSION)")
+            simulate_draft(
+                input_fasta=args.input,
+                output_fasta=args.output,
+                completeness=completeness,
+                seed=args.seed,
+                num_threads=num_threads,
+                max_contig_size=args.max_contig_size,
+                fragment_size=args.fragment_size,
+                overlap=args.overlap,
+                log_file=log_file,
+                create_visualization=create_vis,
+                stats_json_path=args.stats_json,
+                use_nucmer=args.use_nucmer,
+                nucmer_min_identity=args.nucmer_min_identity,
+                nucmer_min_length=args.nucmer_min_length
+            )
+        else:
+            debug_print("About to call simulate_target_n50 function...")
+            simulate_target_n50(
+                input_fasta=args.input,
+                output_fasta=args.output,
+                target_n50=args.target_n50,
+                seed=args.seed,
+                num_threads=num_threads,
+                max_contig_size=args.max_contig_size,
+                fragment_size=args.fragment_size,
+                overlap=args.overlap,
+                log_file=log_file,
+                create_visualization=create_vis,
+                n50_plot_path=args.n50_plot,
+                stats_json_path=args.stats_json,
+                min_contig_size=args.min_contig_size,
+                breakpoint_jitter=args.breakpoint_jitter,
+                use_nucmer=args.use_nucmer,
+                nucmer_min_identity=args.nucmer_min_identity,
+                nucmer_min_length=args.nucmer_min_length
+            )
         debug_print("Script completed successfully! (FIXED VERSION)")
     except Exception as e:
         debug_print(f"Script failed with error: {e}")
