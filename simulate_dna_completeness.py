@@ -998,18 +998,18 @@ def select_breakpoints_for_target_n50(seq: str, prioritized_blocks: List[Tuple[i
     if target_n50 <= 0:
         raise ValueError(f"Target N50 must be a positive integer, got {target_n50}")
 
-    if target_n50 > genome_length:
-        debug_print(
-            f"Requested target N50 ({target_n50:,} bp) exceeds the total input genome "
-            f"length ({genome_length:,} bp); returning the input assembly unchanged"
-        )
-        return current_state
-
     if target_n50 > current_state["n50"]:
-        raise ValueError(
-            f"Target N50 ({target_n50:,} bp) is larger than the input assembly N50 "
-            f"({current_state['n50']:,} bp). This mode can fragment, but it cannot scaffold."
-        )
+        if target_n50 > genome_length:
+            debug_print(
+                f"Requested target N50 ({target_n50:,} bp) exceeds the total input genome "
+                f"length ({genome_length:,} bp); returning the input assembly unchanged"
+            )
+        else:
+            debug_print(
+                f"Requested target N50 ({target_n50:,} bp) exceeds the input assembly N50 "
+                f"({current_state['n50']:,} bp); returning the input assembly unchanged"
+            )
+        return current_state
 
     if min_contig_size <= 0:
         raise ValueError(f"Minimum contig size must be positive, got {min_contig_size}")
