@@ -170,6 +170,7 @@ pixi run simulate --input GCA_000157015_1.fna \
 
 This keeps the genome fully complete, but introduces biologically-motivated breakpoints until the resulting contig set approaches the requested N50.
 The contig-length plot is a horizontal bar chart sorted from longest to shortest, with the N50-defining contig highlighted and target/actual N50 markers overlaid.
+If `--target-n50` exceeds the total input genome length, the tool now returns the input assembly unchanged instead of failing.
 
 ### Available Pixi Tasks
 
