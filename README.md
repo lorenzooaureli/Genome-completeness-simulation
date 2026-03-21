@@ -51,8 +51,8 @@ iwr -useb https://pixi.sh/install.ps1 | iex
 
 ```bash
 # Clone the repository
-git clone https://github.com/lorenzooaureli/Genome-completeness-simulation.git
-cd Genome-completeness-simulation
+git clone https://github.com/lorenzooaureli/Genome-quality-simulation.git
+cd Genome-quality-simulation
 
 # Install all dependencies automatically
 pixi install

@@ -1,13 +1,13 @@
 [project]
-name = "genome-completeness-simulation"
+name = "genome-quality-simulation"
 version = "0.1.0"
 description = "Tool for simulating realistic draft bacterial genomes by completeness loss or target N50 fragmentation"
 authors = ["Lorenzo Aureli <lorenzooaureli@users.noreply.github.com>"]
 channels = ["conda-forge", "bioconda"]
 platforms = ["linux-64", "osx-64", "osx-arm64"]
 license = "MIT"
-homepage = "https://github.com/lorenzooaureli/Genome-completeness-simulation"
-repository = "https://github.com/lorenzooaureli/Genome-completeness-simulation"
+homepage = "https://github.com/lorenzooaureli/Genome-quality-simulation"
+repository = "https://github.com/lorenzooaureli/Genome-quality-simulation"
 readme = "README.md"
 
 [dependencies]
